@@ -173,6 +173,15 @@ int PACE_STEP2_dec_nonce(const EAC_CTX * ctx, const PACE_SEC * pi,
  */
 BUF_MEM *
 PACE_STEP3A_generate_mapping_data(const EAC_CTX * ctx);
+
+/* Simulator extensions required by ICAO PACE-CAM. Returned BUF_MEM values
+ * are caller-owned and contain copies of private protocol material. */
+BUF_MEM *PACE_CAM_get_mapping_private_key(const EAC_CTX *ctx);
+BUF_MEM *PACE_CAM_get_group_order(const EAC_CTX *ctx);
+int PACE_CAM_verify_mapping_data(const EAC_CTX *ctx,
+        const unsigned char *ca_data, size_t ca_length,
+        const unsigned char *static_data, size_t static_length,
+        const unsigned char *mapping_data, size_t mapping_length);
 /**
  * @brief Map to the ephemeral domain parameters.
  *

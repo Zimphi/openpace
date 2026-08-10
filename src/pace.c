@@ -119,6 +119,87 @@ PACE_STEP3A_generate_mapping_data(const EAC_CTX * ctx)
     return ctx->pace_ctx->map_generate_key(ctx->pace_ctx, ctx->bn_ctx);
 }
 
+/* Simulator extension: export a copy of the private ECDH mapping scalar.
+ * PACE-CAM needs this scalar to calculate CA_PICC = SK_PICC^-1 * SK_Map,PICC.
+ * The caller owns the returned BUF_MEM and must clear it after use. */
+BUF_MEM *
+PACE_CAM_get_mapping_private_key(const EAC_CTX *ctx)
+{
+    EC_KEY *key = NULL;
+    const BIGNUM *private_key = NULL;
+    BUF_MEM *result = NULL;
+
+    if (!ctx || !ctx->pace_ctx || !ctx->pace_ctx->static_key)
+        return NULL;
+    key = EVP_PKEY_get1_EC_KEY(ctx->pace_ctx->static_key);
+    if (!key)
+        return NULL;
+    private_key = EC_KEY_get0_private_key(key);
+    if (private_key)
+        result = BN_bn2buf(private_key);
+    EC_KEY_free(key);
+    return result;
+}
+
+BUF_MEM *
+PACE_CAM_get_group_order(const EAC_CTX *ctx)
+{
+    EC_KEY *key = NULL;
+    const EC_GROUP *group = NULL;
+    BIGNUM *order = NULL;
+    BUF_MEM *result = NULL;
+
+    if (!ctx || !ctx->pace_ctx || !ctx->pace_ctx->static_key)
+        return NULL;
+    key = EVP_PKEY_get1_EC_KEY(ctx->pace_ctx->static_key);
+    if (!key)
+        return NULL;
+    group = EC_KEY_get0_group(key);
+    order = BN_new();
+    if (group && order && EC_GROUP_get_order(group, order, ctx->bn_ctx))
+        result = BN_bn2buf(order);
+    BN_clear_free(order);
+    EC_KEY_free(key);
+    return result;
+}
+
+int
+PACE_CAM_verify_mapping_data(const EAC_CTX *ctx,
+        const unsigned char *ca_data, size_t ca_length,
+        const unsigned char *static_data, size_t static_length,
+        const unsigned char *mapping_data, size_t mapping_length)
+{
+    EC_KEY *key = NULL;
+    const EC_GROUP *group = NULL;
+    EC_POINT *static_point = NULL, *expected = NULL, *mapping_point = NULL;
+    BIGNUM *scalar = NULL;
+    int result = 0;
+
+    if (!ctx || !ctx->pace_ctx || !ctx->pace_ctx->static_key ||
+            !ca_data || !static_data || !mapping_data)
+        return 0;
+    key = EVP_PKEY_get1_EC_KEY(ctx->pace_ctx->static_key);
+    if (!key)
+        return 0;
+    group = EC_KEY_get0_group(key);
+    static_point = EC_POINT_new(group);
+    expected = EC_POINT_new(group);
+    mapping_point = EC_POINT_new(group);
+    scalar = BN_bin2bn(ca_data, ca_length, NULL);
+    if (group && static_point && expected && mapping_point && scalar &&
+            EC_POINT_oct2point(group, static_point, static_data, static_length, ctx->bn_ctx) &&
+            EC_POINT_oct2point(group, mapping_point, mapping_data, mapping_length, ctx->bn_ctx) &&
+            EC_POINT_mul(group, expected, NULL, static_point, scalar, ctx->bn_ctx) &&
+            EC_POINT_cmp(group, expected, mapping_point, ctx->bn_ctx) == 0)
+        result = 1;
+    BN_clear_free(scalar);
+    EC_POINT_clear_free(static_point);
+    EC_POINT_clear_free(expected);
+    EC_POINT_clear_free(mapping_point);
+    EC_KEY_free(key);
+    return result;
+}
+
 int
 PACE_STEP3A_map_generator(const EAC_CTX * ctx, const BUF_MEM * in)
 {

@@ -355,10 +355,13 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     BIGNUM * a = NULL, *b = NULL, *p = NULL;
     BIGNUM * x = NULL, *y = NULL, *v = NULL, *u = NULL;
     BIGNUM * tmp = NULL, *tmp2 = NULL, *bn_inv = NULL;
+    BIGNUM * alpha = NULL, *x2 = NULL, *x3 = NULL, *h2 = NULL;
+    BIGNUM * exponent = NULL, *order = NULL, *cofactor = NULL;
     BIGNUM * two = NULL, *three = NULL, *four = NULL, *six = NULL;
     BIGNUM * twentyseven = NULL;
     EC_KEY *static_key = NULL, *ephemeral_key = NULL;
     EC_POINT *g = NULL;
+    EC_GROUP *group = NULL;
 
     BN_CTX_start(bn_ctx);
 
@@ -383,7 +386,14 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     tmp = BN_CTX_get(bn_ctx);
     tmp2 = BN_CTX_get(bn_ctx);
     bn_inv = BN_CTX_get(bn_ctx);
-    if (!bn_inv)
+    alpha = BN_CTX_get(bn_ctx);
+    x2 = BN_CTX_get(bn_ctx);
+    x3 = BN_CTX_get(bn_ctx);
+    h2 = BN_CTX_get(bn_ctx);
+    exponent = BN_CTX_get(bn_ctx);
+    order = BN_CTX_get(bn_ctx);
+    cofactor = BN_CTX_get(bn_ctx);
+    if (!cofactor)
         goto err;
 
     /* Encrypt the Nonce using the symmetric key in */
@@ -403,60 +413,60 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
             !BN_set_word(twentyseven,27)
             ) goto err;
 
-    /* Check prerequisites for curve parameters */
-    check(
-            /* p > 3;*/
-           (BN_cmp(p, three) == 1) &&
-           /* p mod 3 = 2; (p has the form p=q^n, q prime) */
-           BN_nnmod(tmp, p, three, bn_ctx) &&
-           (BN_cmp(tmp, two) == 0),
-        "Unsuited curve");
-
     /* Convert encrypted nonce to BIGNUM */
     u = BN_bin2bn((unsigned char *) x_mem->data, x_mem->length, u);
     if (!u)
         goto err;
 
-    if ( /* v = (3a - u^4) / 6u mod p */
-            !BN_mod_mul(tmp, three, a, p, bn_ctx) ||
-            !BN_mod_exp(tmp2, u, four, p, bn_ctx) ||
-            !BN_mod_sub(v, tmp, tmp2, p, bn_ctx) ||
-            !BN_mod_mul(tmp, u, six, p, bn_ctx) ||
-            /* For division within a galois field we need to compute
-             * the multiplicative inverse of a number */
+    /* ICAO Doc 9303-11, Appendix B.2: point encoding for affine
+     * coordinates.  The former Icart-only implementation required
+     * p = 2 mod 3 and rejected five standardized PACE curves. */
+    check((BN_cmp(p, three) == 1) && !BN_is_zero(u), "Unsuited curve");
+    check(BN_mod_word(p, 4) == 3, "Point encoding requires p = 3 mod 4");
+    if (
+            /* 1. alpha = -t^2 mod p */
+            !BN_mod_sqr(alpha, u, p, bn_ctx) ||
+            !BN_mod_sub(alpha, BN_value_one(), alpha, p, bn_ctx) ||
+            !BN_mod_sub(alpha, alpha, BN_value_one(), p, bn_ctx) ||
+            /* 2. X2 = -b/a * (1 + 1/(alpha + alpha^2)) */
+            !BN_mod_sqr(tmp, alpha, p, bn_ctx) ||
+            !BN_mod_add(tmp, alpha, tmp, p, bn_ctx) ||
             !BN_mod_inverse(bn_inv, tmp, p, bn_ctx) ||
-            !BN_mod_mul(v, v, bn_inv, p, bn_ctx) ||
-
-            /* x = (v^2 - b - ((u^6)/27)) */
-            !BN_mod_sqr(tmp, v, p, bn_ctx) ||
-            !BN_mod_sub(tmp2, tmp, b, p, bn_ctx) ||
-            !BN_mod_exp(tmp, u, six, p, bn_ctx) ||
-            !BN_mod_inverse(bn_inv, twentyseven, p, bn_ctx) ||
-            !BN_mod_mul(tmp, tmp, bn_inv, p, bn_ctx) ||
-            !BN_mod_sub(x, tmp2, tmp, p, bn_ctx) ||
-
-            /* x -> x^(1/3) = x^((2p^n -1)/3) */
-            !BN_mul(tmp, two, p, bn_ctx) ||
-            !BN_sub(tmp, tmp, BN_value_one()) ||
-
-            /* Division is defined, because p^n = 2 mod 3 */
-            !BN_div(tmp, y, tmp, three, bn_ctx) ||
-            !BN_mod_exp(tmp2, x, tmp, p, bn_ctx) ||
-            !BN_copy(x, tmp2) ||
-
-            /* x += (u^2)/3 */
+            !BN_mod_add(tmp, BN_value_one(), bn_inv, p, bn_ctx) ||
+            !BN_mod_inverse(bn_inv, a, p, bn_ctx) ||
+            !BN_mod_mul(x2, b, bn_inv, p, bn_ctx) ||
+            !BN_mod_mul(x2, x2, tmp, p, bn_ctx) ||
+            !BN_mod_sub(x2, BN_value_one(), x2, p, bn_ctx) ||
+            !BN_mod_sub(x2, x2, BN_value_one(), p, bn_ctx) ||
+            /* 3. X3 = alpha * X2 */
+            !BN_mod_mul(x3, alpha, x2, p, bn_ctx) ||
+            /* 4. h2 = X2^3 + a*X2 + b */
+            !BN_mod_sqr(tmp, x2, p, bn_ctx) ||
+            !BN_mod_mul(h2, tmp, x2, p, bn_ctx) ||
+            !BN_mod_mul(tmp, a, x2, p, bn_ctx) ||
+            !BN_mod_add(h2, h2, tmp, p, bn_ctx) ||
+            !BN_mod_add(h2, h2, b, p, bn_ctx) ||
+            /* 6. U = t^3 * h2 (reuse v for U) */
             !BN_mod_sqr(tmp, u, p, bn_ctx) ||
-            !BN_mod_inverse(bn_inv, three, p, bn_ctx) ||
-            !BN_mod_mul(tmp2, tmp, bn_inv, p, bn_ctx) ||
-            !BN_mod_add(tmp, x, tmp2, p, bn_ctx) ||
-            !BN_copy(x, tmp) ||
-
-            /* y = ux + v */
-            !BN_mod_mul(y, u, x, p, bn_ctx) ||
-            !BN_mod_add(tmp, y, v, p, bn_ctx) ||
-            !BN_copy(y, tmp)
-            )
+            !BN_mod_mul(tmp, tmp, u, p, bn_ctx) ||
+            !BN_mod_mul(v, tmp, h2, p, bn_ctx) ||
+            /* 7. A = h2^(p-1-(p+1)/4) */
+            !BN_copy(exponent, p) || !BN_sub_word(exponent, 1) ||
+            !BN_copy(tmp, p) || !BN_add_word(tmp, 1) ||
+            !BN_rshift(tmp, tmp, 2) ||
+            !BN_sub(exponent, exponent, tmp) ||
+            !BN_mod_exp(y, h2, exponent, p, bn_ctx) ||
+            /* Test A^2*h2 == 1. */
+            !BN_mod_sqr(tmp, y, p, bn_ctx) ||
+            !BN_mod_mul(tmp, tmp, h2, p, bn_ctx))
         goto err;
+    if (BN_is_one(tmp)) {
+        if (!BN_copy(x, x2) || !BN_mod_mul(y, y, h2, p, bn_ctx))
+            goto err;
+    } else {
+        if (!BN_copy(x, x3) || !BN_mod_mul(y, y, v, p, bn_ctx))
+            goto err;
+    }
 
     /* Initialize ephemeral parameters with parameters from the static key */
     ephemeral_key = EC_KEY_dup(static_key);
@@ -465,11 +475,18 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     EVP_PKEY_set1_EC_KEY(ctx->ka_ctx->key, ephemeral_key);
 
     /* configure the new EC_KEY */
-    g = EC_POINT_new(EC_KEY_get0_group(ephemeral_key));
-    if (!g)
+    group = EC_GROUP_dup(EC_KEY_get0_group(ephemeral_key));
+    g = EC_POINT_new(group);
+    if (!group || !g ||
+            !EC_GROUP_get_order(group, order, bn_ctx) ||
+            !EC_GROUP_get_cofactor(group, cofactor, bn_ctx))
         goto err;
-    if (!EC_POINT_set_affine_coordinates(EC_KEY_get0_group(ephemeral_key), g,
-            x, y, bn_ctx))
+    if (!EC_POINT_set_affine_coordinates(group, g, x, y, bn_ctx) ||
+            (!BN_is_one(cofactor) &&
+             !EC_POINT_mul(group, g, NULL, g, cofactor, bn_ctx)) ||
+            !EC_GROUP_set_generator(group, g, order, cofactor) ||
+            !EC_GROUP_check(group, bn_ctx) ||
+            !EC_KEY_set_group(ephemeral_key, group))
         goto err;
 
     ret = 1;
@@ -482,6 +499,8 @@ err:
     BN_CTX_end(bn_ctx);
     if (g)
         EC_POINT_clear_free(g);
+    if (group)
+        EC_GROUP_clear_free(group);
     /* Decrement reference count, keys are still available via PACE_CTX */
     if (static_key)
         EC_KEY_free(static_key);
