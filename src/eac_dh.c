@@ -54,6 +54,7 @@
 #include <eac/eac.h>
 #include <openssl/bn.h>
 #include <openssl/evp.h>
+#include <string.h>
 
 /**
  * @brief Public key validation method described in RFC 2631.
@@ -286,6 +287,7 @@ dh_compute_key(EVP_PKEY *key, const BUF_MEM * in, BN_CTX *bn_ctx)
     BUF_MEM * out = NULL;
     BIGNUM * bn = NULL;
     DH *dh = NULL;
+    int secret_length, field_length;
 
     check(key && in, "Invalid arguments");
 
@@ -298,13 +300,27 @@ dh_compute_key(EVP_PKEY *key, const BUF_MEM * in, BN_CTX *bn_ctx)
     if (!bn)
         goto err;
 
-    out = BUF_MEM_create(DH_size(dh));
+    field_length = DH_size(dh);
+    out = BUF_MEM_create(field_length);
     if (!out)
         goto err;
 
-    out->length = DH_compute_key((unsigned char *) out->data, bn, dh);
-    if ((int) out->length < 0)
+    secret_length = DH_compute_key((unsigned char *) out->data, bn, dh);
+    if (secret_length <= 0 || secret_length > field_length)
         goto err;
+
+    /*
+     * DH_compute_key() returns the big-endian integer in minimal encoding.
+     * TR-03110 key derivation, however, consumes the fixed-width field
+     * element.  Preserve leading zero octets; otherwise PACE session keys
+     * disagree with a conforming terminal whenever K starts with 00.
+     */
+    if (secret_length < field_length) {
+        memmove(out->data + field_length - secret_length,
+                out->data, secret_length);
+        memset(out->data, 0, field_length - secret_length);
+    }
+    out->length = field_length;
 
     BN_clear_free(bn);
     DH_free(dh);

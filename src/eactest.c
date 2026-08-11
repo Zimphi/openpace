@@ -48,6 +48,7 @@
 #endif
 
 #include "eac_util.h"
+#include "eac_dh.h"
 #include "misc.h"
 #include "ssl_compat.h"
 #include <eac/ca.h>
@@ -3814,6 +3815,63 @@ test_parsing(void)
 
 /******************************************************************************/
 
+static int
+test_fixed_width_dh_secret(void)
+{
+    static char peer_data[] = { 2 };
+    const BUF_MEM peer = {
+        sizeof peer_data, peer_data, sizeof peer_data,
+    };
+    BUF_MEM *secret = NULL;
+    EVP_PKEY *key = NULL;
+    DH *dh = NULL;
+    BIGNUM *private_key = NULL, *public_key = NULL;
+    BN_CTX *bn_ctx = NULL;
+    int field_length = 0;
+    int failed = 1;
+    int zero_padding = 1;
+    size_t i;
+
+    printf("DH fixed-width shared secret: %s", verbose ? "\n" : " ");
+    dh = DH_get_2048_256();
+    key = EVP_PKEY_new();
+    private_key = BN_new();
+    public_key = BN_new();
+    bn_ctx = BN_CTX_new();
+    CHECK(1, dh && key && private_key && public_key && bn_ctx,
+            "Created DH test key");
+    CHECK(1, BN_one(private_key) && BN_one(public_key)
+            && DH_set0_key(dh, public_key, private_key)
+            && EVP_PKEY_assign_DH(key, dh),
+            "Initialized DH test key");
+    dh = NULL;
+    private_key = NULL;
+    public_key = NULL;
+
+    field_length = EVP_PKEY_size(key);
+    secret = dh_compute_key(key, &peer, bn_ctx);
+    CHECK(1, secret && (int) secret->length == field_length,
+            "Preserved DH field width");
+    CHECK(1, (unsigned char) secret->data[field_length - 1] == 2,
+            "Preserved DH shared-secret value");
+    for (i = 0; i < secret->length - 1; i++)
+        zero_padding &= (unsigned char) secret->data[i] == 0;
+    CHECK(1, zero_padding, "Left-padded DH shared secret");
+    failed = 0;
+
+err:
+    BUF_MEM_free(secret);
+    EVP_PKEY_free(key);
+    DH_free(dh);
+    BN_clear_free(private_key);
+    BN_clear_free(public_key);
+    BN_CTX_free(bn_ctx);
+    TESTEND;
+    return failed;
+}
+
+/******************************************************************************/
+
 int
 main(int argc, char *argv[])
 {
@@ -3879,6 +3937,7 @@ main(int argc, char *argv[])
     pace_raw[(sizeof pace_raw) - 1] = '\0';
 
     EAC_init();
+    failed += test_fixed_width_dh_secret();
     failed += test_parsing();
     failed += test_worked_examples();
     failed += do_dynamic_eac_tests();
