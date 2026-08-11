@@ -61,11 +61,25 @@
 #include <openssl/objects.h>
 #include <string.h>
 
+static int
+pace_uses_integrated_mapping(int protocol)
+{
+    return protocol == NID_id_PACE_DH_IM_3DES_CBC_CBC
+        || protocol == NID_id_PACE_DH_IM_AES_CBC_CMAC_128
+        || protocol == NID_id_PACE_DH_IM_AES_CBC_CMAC_192
+        || protocol == NID_id_PACE_DH_IM_AES_CBC_CMAC_256
+        || protocol == NID_id_PACE_ECDH_IM_3DES_CBC_CBC
+        || protocol == NID_id_PACE_ECDH_IM_AES_CBC_CMAC_128
+        || protocol == NID_id_PACE_ECDH_IM_AES_CBC_CMAC_192
+        || protocol == NID_id_PACE_ECDH_IM_AES_CBC_CMAC_256;
+}
+
 BUF_MEM *
 PACE_STEP1_enc_nonce(const EAC_CTX * ctx, const PACE_SEC * pi)
 {
     BUF_MEM * enc_nonce = NULL;
     BUF_MEM * key = NULL;
+    int nonce_length;
 
     check((ctx && ctx->pace_ctx && ctx->pace_ctx->ka_ctx &&
                 ctx->pace_ctx->ka_ctx->cipher),
@@ -74,8 +88,18 @@ PACE_STEP1_enc_nonce(const EAC_CTX * ctx, const PACE_SEC * pi)
     key = kdf_pi(pi, NULL, ctx->pace_ctx->ka_ctx, ctx->md_ctx);
     check(key, "Key derivation function failed");
 
+    nonce_length = EVP_CIPHER_block_size(ctx->pace_ctx->ka_ctx->cipher);
+    if (pace_uses_integrated_mapping(ctx->pace_ctx->protocol)) {
+        /* ICAO 9303-11, 4.4.3.3.2: IM needs l >= k and l must be a
+         * multiple of the block size.  3DES counts as a 128-bit cipher. */
+        nonce_length = EVP_CIPHER_key_length(ctx->pace_ctx->ka_ctx->cipher);
+        if (nonce_length < 16)
+            nonce_length = 16;
+        nonce_length = ((nonce_length + 15) / 16) * 16;
+    }
+
     BUF_MEM_clear_free(ctx->pace_ctx->nonce);
-    ctx->pace_ctx->nonce = randb(EVP_CIPHER_block_size(ctx->pace_ctx->ka_ctx->cipher));
+    ctx->pace_ctx->nonce = randb(nonce_length);
     check(ctx->pace_ctx->nonce, "Failed to create nonce");
 
     enc_nonce = cipher_no_pad(ctx->pace_ctx->ka_ctx, ctx->cipher_ctx, key, ctx->pace_ctx->nonce, 1);

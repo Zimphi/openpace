@@ -59,6 +59,110 @@
 #include <openssl/ec.h>
 #include <openssl/ecdh.h>
 
+/* ICAO 9303-11, 4.4.3.3.2, Figure 2.  Integrated Mapping does not map
+ * E_t(s) directly.  It expands s and t with the iterated CBC construction
+ * and only then reduces the result modulo the field prime. */
+static BUF_MEM *
+im_pseudo_random(const PACE_CTX *ctx, const BUF_MEM *s, const BUF_MEM *t,
+        const BIGNUM *p, BN_CTX *bn_ctx)
+{
+    static const unsigned char c0_128[] = {
+        0xa6, 0x68, 0x89, 0x2a, 0x7c, 0x41, 0xe3, 0xca,
+        0x73, 0x9f, 0x40, 0xb0, 0x57, 0xd8, 0x59, 0x04
+    };
+    static const unsigned char c1_128[] = {
+        0xa4, 0xe1, 0x36, 0xac, 0x72, 0x5f, 0x73, 0x8b,
+        0x01, 0xc1, 0xf6, 0x02, 0x17, 0xc1, 0x88, 0xad
+    };
+    static const unsigned char c0_256[] = {
+        0xd4, 0x63, 0xd6, 0x52, 0x34, 0x12, 0x4e, 0xf7,
+        0x89, 0x70, 0x54, 0x98, 0x6d, 0xca, 0x0a, 0x17,
+        0x4e, 0x28, 0xdf, 0x75, 0x8c, 0xba, 0xa0, 0x3f,
+        0x24, 0x06, 0x16, 0x41, 0x4d, 0x5a, 0x16, 0x76
+    };
+    static const unsigned char c1_256[] = {
+        0x54, 0xbd, 0x72, 0x55, 0xf0, 0xaa, 0xf8, 0x31,
+        0xbe, 0xc3, 0x42, 0x3f, 0xcf, 0x39, 0xd6, 0x9b,
+        0x6c, 0xbf, 0x06, 0x66, 0x77, 0xd0, 0xfa, 0xae,
+        0x5a, 0xad, 0xd9, 0x9d, 0xf8, 0xe5, 0x35, 0x17
+    };
+    BUF_MEM *c0 = NULL, *c1 = NULL, *key = NULL, *k = NULL;
+    BUF_MEM *next = NULL, *x = NULL, *expanded = NULL, *result = NULL;
+    BIGNUM *expanded_bn = NULL, *reduced_bn = NULL;
+    const unsigned char *c0_data, *c1_data;
+    size_t constant_length, key_length, iterations, i;
+    int required_bits;
+
+    check(ctx && ctx->ka_ctx && ctx->ka_ctx->cipher && s && t && p,
+            "Invalid arguments");
+
+    key_length = EVP_CIPHER_key_length(ctx->ka_ctx->cipher);
+    check(t->length == key_length && s->length > 0, "Invalid IM nonce length");
+    if (key_length <= 16) {
+        c0_data = c0_128;
+        c1_data = c1_128;
+        constant_length = sizeof(c0_128);
+    } else {
+        c0_data = c0_256;
+        c1_data = c1_256;
+        constant_length = sizeof(c0_256);
+    }
+    check(s->length == constant_length, "Invalid IM chip nonce length");
+
+    required_bits = BN_num_bits(p) + 64;
+    iterations = ((size_t) required_bits + s->length * 8 - 1)
+        / (s->length * 8);
+    c0 = BUF_MEM_create_init(c0_data, constant_length);
+    c1 = BUF_MEM_create_init(c1_data, constant_length);
+    expanded = BUF_MEM_new();
+    check(c0 && c1 && expanded
+            && BUF_MEM_grow(expanded, iterations * s->length),
+            "Failed to initialize IM pseudo-random mapping");
+
+    /* k0 = E_t(s). */
+    k = cipher_no_pad(ctx->ka_ctx, NULL, t, s, 1);
+    check(k && k->length == s->length, "Failed to initialize IM mapping");
+
+    for (i = 0; i < iterations; i++) {
+        /* AES-192 uses the first 24 octets of k_i as the next key. */
+        key = BUF_MEM_create_init(k->data, key_length);
+        check(key, "Failed to create IM iteration key");
+        x = cipher_no_pad(ctx->ka_ctx, NULL, key, c1, 1);
+        next = cipher_no_pad(ctx->ka_ctx, NULL, key, c0, 1);
+        check(x && next && x->length == s->length
+                && next->length == s->length,
+                "Failed to expand IM pseudo-random mapping");
+        memcpy(expanded->data + i * s->length, x->data, s->length);
+        BUF_MEM_clear_free(key);
+        key = NULL;
+        BUF_MEM_clear_free(x);
+        x = NULL;
+        BUF_MEM_clear_free(k);
+        k = next;
+        next = NULL;
+    }
+
+    expanded_bn = BN_bin2bn((unsigned char *) expanded->data,
+            expanded->length, NULL);
+    reduced_bn = BN_new();
+    check(expanded_bn && reduced_bn
+            && BN_nnmod(reduced_bn, expanded_bn, p, bn_ctx),
+            "Failed to reduce IM pseudo-random mapping");
+    result = BN_bn2buf(reduced_bn);
+
+err:
+    BUF_MEM_clear_free(c0);
+    BUF_MEM_clear_free(c1);
+    BUF_MEM_clear_free(key);
+    BUF_MEM_clear_free(k);
+    BUF_MEM_clear_free(next);
+    BUF_MEM_clear_free(x);
+    BUF_MEM_clear_free(expanded);
+    BN_clear_free(expanded_bn);
+    BN_clear_free(reduced_bn);
+    return result;
+}
+
 BUF_MEM *
 dh_gm_generate_key(const PACE_CTX * ctx, BN_CTX *bn_ctx)
 {
@@ -181,15 +285,15 @@ dh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
         goto err;
     DH_get0_pqg(ephemeral_key, &p, NULL, &g);
 
-    /* Perform the actual mapping */
-    x_mem = cipher_no_pad(ctx->ka_ctx, NULL, in, s, 1);
-    if (!x_mem)
-        goto err;
-    x_bn = BN_bin2bn((unsigned char *) x_mem->data, x_mem->length, x_bn);
     a = BN_CTX_get(bn_ctx);
     q = DH_get_q(static_key, bn_ctx);
     p_1 = BN_dup(p);
     g_new = BN_dup(g);
+    /* Perform the actual mapping. */
+    x_mem = im_pseudo_random(ctx, s, in, p, bn_ctx);
+    if (!x_mem)
+        goto err;
+    x_bn = BN_bin2bn((unsigned char *) x_mem->data, x_mem->length, x_bn);
     if (!x_bn || !a || !q || !p_1 || !g_new ||
             /* p_1 = p-1 */
             !BN_sub_word(p_1, 1) ||
@@ -396,13 +500,13 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     if (!cofactor)
         goto err;
 
-    /* Encrypt the Nonce using the symmetric key in */
-    x_mem = cipher_no_pad(ctx->ka_ctx, NULL, in, s, 1);
-    if (!x_mem)
-        goto err;
-
     /* Fetch the curve parameters */
     if (!EC_GROUP_get_curve_GFp(EC_KEY_get0_group(static_key), p, a, b, bn_ctx))
+        goto err;
+
+    /* Expand and reduce both nonces as required by Integrated Mapping. */
+    x_mem = im_pseudo_random(ctx, s, in, p, bn_ctx);
+    if (!x_mem)
         goto err;
 
     /* Assign constants */

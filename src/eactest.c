@@ -50,6 +50,7 @@
 #include "eac_util.h"
 #include "eac_dh.h"
 #include "misc.h"
+#include "pace_mappings.h"
 #include "ssl_compat.h"
 #include <eac/ca.h>
 #include <eac/cv_cert.h>
@@ -3872,6 +3873,102 @@ err:
 
 /******************************************************************************/
 
+static BUF_MEM *
+buf_from_hex(const char *hex)
+{
+    BIGNUM *bn = NULL;
+    BUF_MEM *result = NULL;
+
+    if (BN_hex2bn(&bn, hex))
+        result = BN_bn2buf(bn);
+    BN_clear_free(bn);
+    return result;
+}
+
+static int
+test_integrated_mapping_worked_examples(void)
+{
+    EAC_CTX *ec_ctx = NULL, *dh_ctx = NULL;
+    BUF_MEM *ec_s = NULL, *ec_t = NULL, *dh_s = NULL, *dh_t = NULL;
+    EC_KEY *ec_key = NULL;
+    DH *dh_key = NULL;
+    BIGNUM *x = NULL, *y = NULL, *expected_x = NULL, *expected_y = NULL;
+    BIGNUM *expected_g = NULL;
+    const BIGNUM *actual_g = NULL;
+    const EC_GROUP *group = NULL;
+    const EC_POINT *generator = NULL;
+    int failed = 1;
+
+    printf("PACE-IM ICAO worked examples: %s", verbose ? "\n" : " ");
+
+    ec_ctx = EAC_CTX_new();
+    ec_s = buf_from_hex("2923BE84E16CD6AE529049F1F1BBE9EB");
+    ec_t = buf_from_hex("5DD4CBFC96F5453B130D890A1CDBAE32");
+    BN_hex2bn(&expected_x,
+            "8E82D31559ED0FDE92A4D0498ADD3C23BABA94FB77691E31E90AEA77FB17D427");
+    BN_hex2bn(&expected_y,
+            "4C1AE14BD0C3DBAC0C871B7F3608169364437CA30AC243A089D3F266C1E60FAD");
+    x = BN_new();
+    y = BN_new();
+    CHECK(1, ec_ctx && ec_s && ec_t && expected_x && expected_y && x && y,
+            "Created ECDH Integrated Mapping test data");
+    ec_ctx->tr_version = EAC_TR_VERSION_2_01;
+    CHECK(1, EAC_CTX_init_pace(ec_ctx,
+            NID_id_PACE_ECDH_IM_AES_CBC_CMAC_128, 13),
+            "Initialized ECDH Integrated Mapping");
+    CHECK(1, ecdh_im_compute_key(ec_ctx->pace_ctx, ec_s, ec_t,
+            ec_ctx->bn_ctx), "Computed ECDH Integrated Mapping");
+    ec_key = EVP_PKEY_get1_EC_KEY(ec_ctx->pace_ctx->ka_ctx->key);
+    group = ec_key ? EC_KEY_get0_group(ec_key) : NULL;
+    generator = group ? EC_GROUP_get0_generator(group) : NULL;
+    CHECK(1, generator && EC_POINT_get_affine_coordinates(group, generator,
+            x, y, ec_ctx->bn_ctx) && BN_cmp(x, expected_x) == 0
+            && BN_cmp(y, expected_y) == 0,
+            "Matched ICAO ECDH Integrated Mapping generator");
+
+    dh_ctx = EAC_CTX_new();
+    dh_s = buf_from_hex("FA5B7E3E49753A0DB9178B7B9BD898C8");
+    dh_t = buf_from_hex("B3A6DB3C870C3E99245E0D1C06B747DE");
+    BN_hex2bn(&expected_g,
+            "1D7D767F11E333BCD6DBAEF40E799E7A926B96973550656FF3C830726D118D61"
+            "C276CDCC61D475CF03A98E0C0E79CAEBA5BE25578BD4551D0B10903236F0B0F9"
+            "76852FA78EEA14EA0ACA87D1E91F688FE0DFF897BBE35A472621D343564B262F"
+            "34223AE8FC59B664BFEDFA2BFE7516CA5510A6BBB633D517EC25D4E0BBAA16C2");
+    CHECK(1, dh_ctx && dh_s && dh_t && expected_g,
+            "Created DH Integrated Mapping test data");
+    dh_ctx->tr_version = EAC_TR_VERSION_2_01;
+    CHECK(1, EAC_CTX_init_pace(dh_ctx,
+            NID_id_PACE_DH_IM_AES_CBC_CMAC_128, 0),
+            "Initialized DH Integrated Mapping");
+    CHECK(1, dh_im_compute_key(dh_ctx->pace_ctx, dh_s, dh_t,
+            dh_ctx->bn_ctx), "Computed DH Integrated Mapping");
+    dh_key = EVP_PKEY_get1_DH(dh_ctx->pace_ctx->ka_ctx->key);
+    if (dh_key)
+        DH_get0_pqg(dh_key, NULL, NULL, &actual_g);
+    CHECK(1, actual_g && BN_cmp(actual_g, expected_g) == 0,
+            "Matched ICAO DH Integrated Mapping generator");
+    failed = 0;
+
+err:
+    EAC_CTX_clear_free(ec_ctx);
+    EAC_CTX_clear_free(dh_ctx);
+    BUF_MEM_clear_free(ec_s);
+    BUF_MEM_clear_free(ec_t);
+    BUF_MEM_clear_free(dh_s);
+    BUF_MEM_clear_free(dh_t);
+    EC_KEY_free(ec_key);
+    DH_free(dh_key);
+    BN_clear_free(x);
+    BN_clear_free(y);
+    BN_clear_free(expected_x);
+    BN_clear_free(expected_y);
+    BN_clear_free(expected_g);
+    TESTEND;
+    return failed;
+}
+
+/******************************************************************************/
+
 int
 main(int argc, char *argv[])
 {
@@ -3938,6 +4035,7 @@ main(int argc, char *argv[])
 
     EAC_init();
     failed += test_fixed_width_dh_secret();
+    failed += test_integrated_mapping_worked_examples();
     failed += test_parsing();
     failed += test_worked_examples();
     failed += do_dynamic_eac_tests();
