@@ -60,18 +60,13 @@
 #include <openssl/evp.h>
 #include <openssl/objects.h>
 #include <string.h>
+#include <limits.h>
 
 static int
-pace_uses_integrated_mapping(int protocol)
+pace_uses_integrated_mapping(const PACE_CTX *ctx)
 {
-    return protocol == NID_id_PACE_DH_IM_3DES_CBC_CBC
-        || protocol == NID_id_PACE_DH_IM_AES_CBC_CMAC_128
-        || protocol == NID_id_PACE_DH_IM_AES_CBC_CMAC_192
-        || protocol == NID_id_PACE_DH_IM_AES_CBC_CMAC_256
-        || protocol == NID_id_PACE_ECDH_IM_3DES_CBC_CBC
-        || protocol == NID_id_PACE_ECDH_IM_AES_CBC_CMAC_128
-        || protocol == NID_id_PACE_ECDH_IM_AES_CBC_CMAC_192
-        || protocol == NID_id_PACE_ECDH_IM_AES_CBC_CMAC_256;
+    return ctx->map_compute_key == dh_im_compute_key
+        || ctx->map_compute_key == ecdh_im_compute_key;
 }
 
 BUF_MEM *
@@ -89,7 +84,7 @@ PACE_STEP1_enc_nonce(const EAC_CTX * ctx, const PACE_SEC * pi)
     check(key, "Key derivation function failed");
 
     nonce_length = EVP_CIPHER_block_size(ctx->pace_ctx->ka_ctx->cipher);
-    if (pace_uses_integrated_mapping(ctx->pace_ctx->protocol)) {
+    if (pace_uses_integrated_mapping(ctx->pace_ctx)) {
         /* ICAO 9303-11, 4.4.3.3.2: IM needs l >= k and l must be a
          * multiple of the block size.  3DES counts as a 128-bit cipher. */
         nonce_length = EVP_CIPHER_key_length(ctx->pace_ctx->ka_ctx->cipher);
@@ -196,27 +191,37 @@ PACE_CAM_verify_mapping_data(const EAC_CTX *ctx,
     EC_KEY *key = NULL;
     const EC_GROUP *group = NULL;
     EC_POINT *static_point = NULL, *expected = NULL, *mapping_point = NULL;
-    BIGNUM *scalar = NULL;
+    BIGNUM *scalar = NULL, *order = NULL;
     int result = 0;
 
     if (!ctx || !ctx->pace_ctx || !ctx->pace_ctx->static_key ||
-            !ca_data || !static_data || !mapping_data)
+            !ca_data || !ca_length || ca_length > INT_MAX ||
+            !static_data || !static_length || !mapping_data || !mapping_length)
         return 0;
     key = EVP_PKEY_get1_EC_KEY(ctx->pace_ctx->static_key);
     if (!key)
         return 0;
     group = EC_KEY_get0_group(key);
+    if (!group)
+        goto err;
     static_point = EC_POINT_new(group);
     expected = EC_POINT_new(group);
     mapping_point = EC_POINT_new(group);
     scalar = BN_bin2bn(ca_data, ca_length, NULL);
-    if (group && static_point && expected && mapping_point && scalar &&
+    order = BN_new();
+    if (static_point && expected && mapping_point && scalar && order &&
+            EC_GROUP_get_order(group, order, ctx->bn_ctx) &&
+            !BN_is_zero(scalar) && BN_cmp(scalar, order) < 0 &&
             EC_POINT_oct2point(group, static_point, static_data, static_length, ctx->bn_ctx) &&
             EC_POINT_oct2point(group, mapping_point, mapping_data, mapping_length, ctx->bn_ctx) &&
+            EC_POINT_is_at_infinity(group, static_point) == 0 &&
+            EC_POINT_is_at_infinity(group, mapping_point) == 0 &&
             EC_POINT_mul(group, expected, NULL, static_point, scalar, ctx->bn_ctx) &&
             EC_POINT_cmp(group, expected, mapping_point, ctx->bn_ctx) == 0)
         result = 1;
+err:
     BN_clear_free(scalar);
+    BN_clear_free(order);
     EC_POINT_clear_free(static_point);
     EC_POINT_clear_free(expected);
     EC_POINT_clear_free(mapping_point);

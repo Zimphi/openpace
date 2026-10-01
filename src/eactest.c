@@ -3873,6 +3873,93 @@ err:
 
 /******************************************************************************/
 
+/* Synthetic inputs for the fork extensions; no external test-suite data. */
+static int
+test_mapping_extensions(void)
+{
+    const int protocols[] = {
+        NID_id_PACE_DH_IM_3DES_CBC_CBC, NID_id_PACE_DH_IM_AES_CBC_CMAC_128,
+        NID_id_PACE_DH_IM_AES_CBC_CMAC_192, NID_id_PACE_DH_IM_AES_CBC_CMAC_256,
+        NID_id_PACE_ECDH_IM_3DES_CBC_CBC, NID_id_PACE_ECDH_IM_AES_CBC_CMAC_128,
+        NID_id_PACE_ECDH_IM_AES_CBC_CMAC_192, NID_id_PACE_ECDH_IM_AES_CBC_CMAC_256,
+    };
+    const size_t widths[] = {16, 16, 32, 32, 16, 16, 32, 32};
+    EAC_CTX *ctx = NULL;
+    PACE_SEC *password = NULL;
+    BUF_MEM *nonce = NULL, *mapping = NULL, *private_key = NULL, *order = NULL;
+    EC_KEY *key = NULL;
+    const EC_GROUP *group = NULL;
+    EC_POINT *twice = NULL;
+    unsigned char base[65], doubled[65], scalar = 2, infinity = 0;
+    size_t i, base_length, doubled_length;
+    int failed = 1;
+
+    printf("PACE mapping extension boundaries: %s", verbose ? "\n" : " ");
+    password = PACE_SEC_new("123456", 6, PACE_CAN);
+    CHECK(1, password, "Created synthetic password");
+    for (i = 0; i < sizeof(protocols) / sizeof(protocols[0]); i++) {
+        ctx = EAC_CTX_new();
+        CHECK(1, ctx, "Created IM context");
+        ctx->tr_version = EAC_TR_VERSION_2_01;
+        CHECK(1, EAC_CTX_init_pace(ctx, protocols[i], i < 4 ? 0 : 13),
+                "Initialized IM cipher");
+        nonce = PACE_STEP1_enc_nonce(ctx, password);
+        CHECK(1, nonce && ctx->pace_ctx->nonce->length == widths[i],
+                "Matched IM nonce width");
+        BUF_MEM_clear_free(nonce);
+        nonce = NULL;
+        EAC_CTX_clear_free(ctx);
+        ctx = NULL;
+    }
+
+    ctx = EAC_CTX_new();
+    CHECK(1, ctx && EAC_CTX_init_pace(ctx, NID_id_PACE_ECDH_GM_AES_CBC_CMAC_128, 13),
+            "Created CAM arithmetic context");
+    mapping = PACE_STEP3A_generate_mapping_data(ctx);
+    private_key = PACE_CAM_get_mapping_private_key(ctx);
+    order = PACE_CAM_get_group_order(ctx);
+    CHECK(1, mapping && private_key && private_key->length && order && order->length,
+            "Exported mapping scalar and group order");
+    key = EVP_PKEY_get1_EC_KEY(ctx->pace_ctx->static_key);
+    group = key ? EC_KEY_get0_group(key) : NULL;
+    CHECK(1, group, "Read mapping group");
+    twice = EC_POINT_new(group);
+    CHECK(1, twice && EC_POINT_dbl(group, twice, EC_GROUP_get0_generator(group), ctx->bn_ctx),
+            "Constructed independent CAM relation");
+    base_length = EC_POINT_point2oct(group, EC_GROUP_get0_generator(group),
+            POINT_CONVERSION_UNCOMPRESSED, base, sizeof(base), ctx->bn_ctx);
+    doubled_length = EC_POINT_point2oct(group, twice, POINT_CONVERSION_UNCOMPRESSED,
+            doubled, sizeof(doubled), ctx->bn_ctx);
+    CHECK(1, base_length && doubled_length && PACE_CAM_verify_mapping_data(ctx,
+            &scalar, 1, base, base_length, doubled, doubled_length), "Accepted 2G = 2 * G");
+    scalar = 3;
+    CHECK(1, !PACE_CAM_verify_mapping_data(ctx, &scalar, 1, base, base_length,
+            doubled, doubled_length), "Rejected mismatched scalar");
+    scalar = 0;
+    CHECK(1, !PACE_CAM_verify_mapping_data(ctx, &scalar, 1, &infinity, 1, &infinity, 1),
+            "Rejected zero scalar and infinite points");
+    scalar = 2;
+    CHECK(1, !PACE_CAM_verify_mapping_data(ctx, &scalar, 1, &infinity, 1, &infinity, 1),
+            "Rejected infinite points with valid scalar");
+    CHECK(1, !PACE_CAM_verify_mapping_data(ctx, (unsigned char *)order->data, order->length,
+            base, base_length, doubled, doubled_length), "Rejected out-of-range scalar");
+    CHECK(1, !PACE_CAM_verify_mapping_data(ctx, &scalar, 0, base, base_length,
+            doubled, doubled_length) && !PACE_CAM_verify_mapping_data(NULL,
+            &scalar, 1, base, base_length, doubled, doubled_length), "Rejected missing inputs");
+    failed = 0;
+err:
+    BUF_MEM_clear_free(nonce);
+    BUF_MEM_clear_free(mapping);
+    BUF_MEM_clear_free(private_key);
+    BUF_MEM_clear_free(order);
+    EC_POINT_clear_free(twice);
+    EC_KEY_free(key);
+    PACE_SEC_clear_free(password);
+    EAC_CTX_clear_free(ctx);
+    TESTEND;
+    return failed;
+}
+
 static BUF_MEM *
 buf_from_hex(const char *hex)
 {
@@ -4036,6 +4123,7 @@ main(int argc, char *argv[])
     EAC_init();
     failed += test_fixed_width_dh_secret();
     failed += test_integrated_mapping_worked_examples();
+    failed += test_mapping_extensions();
     failed += test_parsing();
     failed += test_worked_examples();
     failed += do_dynamic_eac_tests();

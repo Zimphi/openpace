@@ -59,9 +59,8 @@
 #include <openssl/ec.h>
 #include <openssl/ecdh.h>
 
-/* ICAO 9303-11, 4.4.3.3.2, Figure 2.  Integrated Mapping does not map
- * E_t(s) directly.  It expands s and t with the iterated CBC construction
- * and only then reduces the result modulo the field prime. */
+/* ICAO Doc 9303-11, 4.4.3.3.2: CBC expansion using the specified constants.
+ * Accumulate the concatenated blocks modulo p to avoid a large temporary. */
 static BUF_MEM *
 im_pseudo_random(const PACE_CTX *ctx, const BUF_MEM *s, const BUF_MEM *t,
         const BIGNUM *p, BN_CTX *bn_ctx)
@@ -86,80 +85,56 @@ im_pseudo_random(const PACE_CTX *ctx, const BUF_MEM *s, const BUF_MEM *t,
         0x6c, 0xbf, 0x06, 0x66, 0x77, 0xd0, 0xfa, 0xae,
         0x5a, 0xad, 0xd9, 0x9d, 0xf8, 0xe5, 0x35, 0x17
     };
-    BUF_MEM *c0 = NULL, *c1 = NULL, *key = NULL, *k = NULL;
-    BUF_MEM *next = NULL, *x = NULL, *expanded = NULL, *result = NULL;
-    BIGNUM *expanded_bn = NULL, *reduced_bn = NULL;
-    const unsigned char *c0_data, *c1_data;
-    size_t constant_length, key_length, iterations, i;
-    int required_bits;
+    BUF_MEM constants[2], iteration_key;
+    BUF_MEM *state = NULL, *block = NULL, *next = NULL, *result = NULL;
+    BIGNUM *value = NULL, *part = NULL;
+    size_t width, key_length, rounds, i;
 
-    check(ctx && ctx->ka_ctx && ctx->ka_ctx->cipher && s && t && p,
+    check(ctx && ctx->ka_ctx && ctx->ka_ctx->cipher && s && t && p && bn_ctx
+            && s->data && t->data && !BN_is_negative(p) && !BN_is_zero(p),
             "Invalid arguments");
 
     key_length = EVP_CIPHER_key_length(ctx->ka_ctx->cipher);
-    check(t->length == key_length && s->length > 0, "Invalid IM nonce length");
-    if (key_length <= 16) {
-        c0_data = c0_128;
-        c1_data = c1_128;
-        constant_length = sizeof(c0_128);
-    } else {
-        c0_data = c0_256;
-        c1_data = c1_256;
-        constant_length = sizeof(c0_256);
-    }
-    check(s->length == constant_length, "Invalid IM chip nonce length");
+    check(key_length == 16 || key_length == 24 || key_length == 32,
+            "Unsupported IM cipher key length");
+    width = key_length <= 16 ? sizeof(c0_128) : sizeof(c0_256);
+    check(t->length == key_length && s->length == width, "Invalid IM nonce length");
+    constants[0].data = (char *)(width == 16 ? c0_128 : c0_256);
+    constants[1].data = (char *)(width == 16 ? c1_128 : c1_256);
+    constants[0].length = constants[0].max = width;
+    constants[1].length = constants[1].max = width;
+    rounds = ((size_t) BN_num_bits(p) + 64 + width * 8 - 1) / (width * 8);
+    value = BN_new();
+    part = BN_new();
+    state = cipher_no_pad(ctx->ka_ctx, NULL, t, s, 1);
+    check(value && part && state && state->length == width, "IM initialization failed");
+    BN_zero(value);
 
-    required_bits = BN_num_bits(p) + 64;
-    iterations = ((size_t) required_bits + s->length * 8 - 1)
-        / (s->length * 8);
-    c0 = BUF_MEM_create_init(c0_data, constant_length);
-    c1 = BUF_MEM_create_init(c1_data, constant_length);
-    expanded = BUF_MEM_new();
-    check(c0 && c1 && expanded
-            && BUF_MEM_grow(expanded, iterations * s->length),
-            "Failed to initialize IM pseudo-random mapping");
-
-    /* k0 = E_t(s). */
-    k = cipher_no_pad(ctx->ka_ctx, NULL, t, s, 1);
-    check(k && k->length == s->length, "Failed to initialize IM mapping");
-
-    for (i = 0; i < iterations; i++) {
-        /* AES-192 uses the first 24 octets of k_i as the next key. */
-        key = BUF_MEM_create_init(k->data, key_length);
-        check(key, "Failed to create IM iteration key");
-        x = cipher_no_pad(ctx->ka_ctx, NULL, key, c1, 1);
-        next = cipher_no_pad(ctx->ka_ctx, NULL, key, c0, 1);
-        check(x && next && x->length == s->length
-                && next->length == s->length,
-                "Failed to expand IM pseudo-random mapping");
-        memcpy(expanded->data + i * s->length, x->data, s->length);
-        BUF_MEM_clear_free(key);
-        key = NULL;
-        BUF_MEM_clear_free(x);
-        x = NULL;
-        BUF_MEM_clear_free(k);
-        k = next;
+    for (i = 0; i < rounds; i++) {
+        /* Borrow the prefix of the state; AES-192 needs 24 of its 32 bytes. */
+        iteration_key.data = state->data;
+        iteration_key.length = iteration_key.max = key_length;
+        block = cipher_no_pad(ctx->ka_ctx, NULL, &iteration_key, &constants[1], 1);
+        next = cipher_no_pad(ctx->ka_ctx, NULL, &iteration_key, &constants[0], 1);
+        check(block && next && block->length == width && next->length == width
+                && BN_bin2bn((unsigned char *)block->data, width, part)
+                && BN_lshift(value, value, width * 8)
+                && BN_add(value, value, part)
+                && BN_nnmod(value, value, p, bn_ctx), "IM expansion failed");
+        BUF_MEM_clear_free(block);
+        block = NULL;
+        BUF_MEM_clear_free(state);
+        state = next;
         next = NULL;
     }
-
-    expanded_bn = BN_bin2bn((unsigned char *) expanded->data,
-            expanded->length, NULL);
-    reduced_bn = BN_new();
-    check(expanded_bn && reduced_bn
-            && BN_nnmod(reduced_bn, expanded_bn, p, bn_ctx),
-            "Failed to reduce IM pseudo-random mapping");
-    result = BN_bn2buf(reduced_bn);
+    result = BN_bn2buf(value);
 
 err:
-    BUF_MEM_clear_free(c0);
-    BUF_MEM_clear_free(c1);
-    BUF_MEM_clear_free(key);
-    BUF_MEM_clear_free(k);
+    BUF_MEM_clear_free(state);
+    BUF_MEM_clear_free(block);
     BUF_MEM_clear_free(next);
-    BUF_MEM_clear_free(x);
-    BUF_MEM_clear_free(expanded);
-    BN_clear_free(expanded_bn);
-    BN_clear_free(reduced_bn);
+    BN_clear_free(value);
+    BN_clear_free(part);
     return result;
 }
 
@@ -458,11 +433,10 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     BUF_MEM * x_mem = NULL;
     BIGNUM * a = NULL, *b = NULL, *p = NULL;
     BIGNUM * x = NULL, *y = NULL, *v = NULL, *u = NULL;
-    BIGNUM * tmp = NULL, *tmp2 = NULL, *bn_inv = NULL;
+    BIGNUM * tmp = NULL, *zero = NULL, *bn_inv = NULL;
     BIGNUM * alpha = NULL, *x2 = NULL, *x3 = NULL, *h2 = NULL;
     BIGNUM * exponent = NULL, *order = NULL, *cofactor = NULL;
-    BIGNUM * two = NULL, *three = NULL, *four = NULL, *six = NULL;
-    BIGNUM * twentyseven = NULL;
+    BIGNUM * three = NULL;
     EC_KEY *static_key = NULL, *ephemeral_key = NULL;
     EC_POINT *g = NULL;
     EC_GROUP *group = NULL;
@@ -482,13 +456,9 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     x = BN_CTX_get(bn_ctx);
     y = BN_CTX_get(bn_ctx);
     v = BN_CTX_get(bn_ctx);
-    two = BN_CTX_get(bn_ctx);
     three = BN_CTX_get(bn_ctx);
-    four = BN_CTX_get(bn_ctx);
-    six = BN_CTX_get(bn_ctx);
-    twentyseven = BN_CTX_get(bn_ctx);
     tmp = BN_CTX_get(bn_ctx);
-    tmp2 = BN_CTX_get(bn_ctx);
+    zero = BN_CTX_get(bn_ctx);
     bn_inv = BN_CTX_get(bn_ctx);
     alpha = BN_CTX_get(bn_ctx);
     x2 = BN_CTX_get(bn_ctx);
@@ -509,13 +479,9 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     if (!x_mem)
         goto err;
 
-    /* Assign constants */
-    if (    !BN_set_word(two,2)||
-            !BN_set_word(three,3)||
-            !BN_set_word(four,4)||
-            !BN_set_word(six,6)||
-            !BN_set_word(twentyseven,27)
-            ) goto err;
+    BN_zero(zero);
+    if (!BN_set_word(three, 3))
+        goto err;
 
     /* Convert encrypted nonce to BIGNUM */
     u = BN_bin2bn((unsigned char *) x_mem->data, x_mem->length, u);
@@ -530,8 +496,7 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     if (
             /* 1. alpha = -t^2 mod p */
             !BN_mod_sqr(alpha, u, p, bn_ctx) ||
-            !BN_mod_sub(alpha, BN_value_one(), alpha, p, bn_ctx) ||
-            !BN_mod_sub(alpha, alpha, BN_value_one(), p, bn_ctx) ||
+            !BN_mod_sub(alpha, zero, alpha, p, bn_ctx) ||
             /* 2. X2 = -b/a * (1 + 1/(alpha + alpha^2)) */
             !BN_mod_sqr(tmp, alpha, p, bn_ctx) ||
             !BN_mod_add(tmp, alpha, tmp, p, bn_ctx) ||
@@ -540,8 +505,7 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
             !BN_mod_inverse(bn_inv, a, p, bn_ctx) ||
             !BN_mod_mul(x2, b, bn_inv, p, bn_ctx) ||
             !BN_mod_mul(x2, x2, tmp, p, bn_ctx) ||
-            !BN_mod_sub(x2, BN_value_one(), x2, p, bn_ctx) ||
-            !BN_mod_sub(x2, x2, BN_value_one(), p, bn_ctx) ||
+            !BN_mod_sub(x2, zero, x2, p, bn_ctx) ||
             /* 3. X3 = alpha * X2 */
             !BN_mod_mul(x3, alpha, x2, p, bn_ctx) ||
             /* 4. h2 = X2^3 + a*X2 + b */
@@ -576,12 +540,13 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     ephemeral_key = EC_KEY_dup(static_key);
     if (!ephemeral_key)
         goto err;
-    EVP_PKEY_set1_EC_KEY(ctx->ka_ctx->key, ephemeral_key);
 
     /* configure the new EC_KEY */
     group = EC_GROUP_dup(EC_KEY_get0_group(ephemeral_key));
+    if (!group)
+        goto err;
     g = EC_POINT_new(group);
-    if (!group || !g ||
+    if (!g ||
             !EC_GROUP_get_order(group, order, bn_ctx) ||
             !EC_GROUP_get_cofactor(group, cofactor, bn_ctx))
         goto err;
@@ -590,7 +555,8 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
              !EC_POINT_mul(group, g, NULL, g, cofactor, bn_ctx)) ||
             !EC_GROUP_set_generator(group, g, order, cofactor) ||
             !EC_GROUP_check(group, bn_ctx) ||
-            !EC_KEY_set_group(ephemeral_key, group))
+            !EC_KEY_set_group(ephemeral_key, group) ||
+            !EVP_PKEY_set1_EC_KEY(ctx->ka_ctx->key, ephemeral_key))
         goto err;
 
     ret = 1;
